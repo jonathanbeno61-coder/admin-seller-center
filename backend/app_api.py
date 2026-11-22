@@ -3,89 +3,41 @@ from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, date
 import sqlite3
-import pandas as pd
-import joblib
+import json
+import math
 import os
-import warnings
-import sklearn.compose._column_transformer as ct
-import sklearn.impute._base as _impute_base
 
 try:
     import mysql.connector
 except ImportError:
     mysql = None
 
-warnings.filterwarnings("ignore")
-
-# =====================================================
-# Penambal kompatibilitas scikit-learn
-# =====================================================
-if not hasattr(ct, "_RemainderColsList"):
-    class _RemainderColsList(list):
-        pass
-    ct._RemainderColsList = _RemainderColsList
-
-_orig_si_setstate = getattr(_impute_base.SimpleImputer, "__setstate__", None)
-
-def _patched_si_setstate(self, state):
-    if "_fill_dtype" in state and "_fit_dtype" not in state:
-        state["_fit_dtype"] = state["_fill_dtype"]
-    if _orig_si_setstate:
-        _orig_si_setstate(self, state)
-    else:
-        self.__dict__.update(state)
-
-_impute_base.SimpleImputer.__setstate__ = _patched_si_setstate
-
 app = Flask(__name__)
 CORS(app)
 
 # ==========================================
-# 1. PEMUATAN 4 BERKAS MODEL (.pkl)
+# 1. PEMUATAN MODEL XGBOOST (JSON RINGAN & AKURAT)
 # ==========================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-RAW_INPUT_FEATURES = [
-    "price",
-    "qty_ordered",
-    "grand_total",
-    "order_year",
-    "order_month",
-    "order_day",
-    "order_dayofweek",
-    "category_name_1",
-    "payment_method_class"
-]
-
 PAYMENT_CLASSES = ["COD", "Online", "Internal Credit"]
+THRESHOLD = 0.50
 
-def cari_lokasi_file(filename):
-    kandidat_lokasi = [
-        os.path.join(BASE_DIR, filename),
-        os.path.join(BASE_DIR, "model", filename),
-    ]
-    for path in kandidat_lokasi:
-        if os.path.exists(path):
-            return path
-    raise FileNotFoundError(f"Berkas {filename} tidak ditemukan.")
-
-def load_artifact(filename):
-    return joblib.load(cari_lokasi_file(filename))
+trees = []
+model_meta = None
+base_margin = 0.0
 
 try:
-    model = load_artifact("xgboost_3class.pkl")
-    preprocessor = load_artifact("preprocessor_3class.pkl")
-    threshold_loaded = load_artifact("threshold_3class.pkl")
-    feature_names_3class = list(load_artifact("feature_names_3class.pkl"))
+    with open(os.path.join(BASE_DIR, "model_xgb.json"), "r", encoding="utf-8") as f:
+        _mj = json.load(f)
+    with open(os.path.join(BASE_DIR, "model_meta.json"), "r", encoding="utf-8") as f:
+        model_meta = json.load(f)
 
-    THRESHOLD = 0.50
-    print(f"MODEL BERHASIL DIMUAT! (Threshold = {THRESHOLD} | File = {threshold_loaded})")
-    print(f"Jumlah Fitur Terproses: {len(feature_names_3class)} kolom")
+    trees = _mj["learner"]["gradient_booster"]["model"]["trees"]
+    _bs = float(model_meta["base_score"])
+    base_margin = math.log(_bs / (1.0 - _bs))
+    print(f"MODEL XGBOOST BERHASIL DIMUAT! ({len(trees)} trees | Threshold = {THRESHOLD})")
 except Exception as e:
-    model = None
-    preprocessor = None
-    THRESHOLD = 0.50
-    feature_names_3class = []
     print(f"GAGAL MEMUAT MODEL: {e}")
 
 CATEGORY_MAP_ID_TO_PK = {
@@ -120,13 +72,30 @@ def normalisasi_metode_pembayaran(metode_input):
     return str(metode_input).strip()
 
 def hitung_probabilitas_batal(feature_dict):
-    df = pd.DataFrame([feature_dict])[RAW_INPUT_FEATURES]
-    X_processed = preprocessor.transform(df)
-    prob_kelas_1 = float(model.predict_proba(X_processed)[0][1])
-    return prob_kelas_1
+    vec = [float(feature_dict[k]) for k in model_meta["numeric_features"]]
+    for val, cats in zip(
+        [feature_dict["category_name_1"], feature_dict["payment_method_class"]],
+        model_meta["cat_categories"],
+    ):
+        for c in cats:
+            vec.append(1.0 if val == c else 0.0)
+
+    total = base_margin
+    for t in trees:
+        node = 0
+        lc = t["left_children"]
+        rc = t["right_children"]
+        si = t["split_indices"]
+        sc = t["split_conditions"]
+        bw = t["base_weights"]
+        while lc[node] != -1:
+            node = lc[node] if vec[si[node]] < sc[node] else rc[node]
+        total += bw[node]
+
+    return 1.0 / (1.0 + math.exp(-total))
 
 # ==========================================
-# 2. DATABASE: MySQL (Lokal/Cloud) + Fallback SQLite (Online Free Tier)
+# 2. DATABASE: MySQL (Lokal) + SQLite (Online)
 # ==========================================
 SQLITE_PATH = os.path.join(BASE_DIR, "seller_center.db")
 USE_MYSQL = False
@@ -138,7 +107,7 @@ def get_mysql_connection():
         user=os.environ.get("MYSQL_USER", "root"),
         password=os.environ.get("MYSQL_PASSWORD", ""),
         database=os.environ.get("MYSQL_DATABASE", "seller_center_db"),
-        connection_timeout=3
+        connection_timeout=3,
     )
 
 def get_sqlite_connection():
@@ -148,8 +117,7 @@ def get_sqlite_connection():
 
 def inisialisasi_database():
     global USE_MYSQL
-    # Coba sambungkan ke MySQL terlebih dahulu
-    if mysql is not None:
+    if mysql is not None and os.environ.get("FORCE_SQLITE") != "1":
         try:
             conn = get_mysql_connection()
             cursor = conn.cursor(dictionary=True)
@@ -176,7 +144,7 @@ def inisialisasi_database():
             if cursor.fetchone() is None:
                 cursor.execute(
                     "INSERT INTO users (username, password) VALUES (%s, %s)",
-                    ("admin@seller.com", generate_password_hash("admin"))
+                    ("admin@seller.com", generate_password_hash("admin")),
                 )
             conn.commit()
             cursor.close()
@@ -185,9 +153,8 @@ def inisialisasi_database():
             print("DATABASE: Terhubung ke MySQL!")
             return
         except Exception as e:
-            print(f"INFO: MySQL tidak tersedia ({e}), beralih ke SQLite lokal.")
+            print(f"INFO: MySQL tidak tersedia ({e}), menggunakan SQLite.")
 
-    # Fallback ke SQLite agar tetap jalan saat deploy online tanpa server MySQL terpisah
     USE_MYSQL = False
     conn = get_sqlite_connection()
     cursor = conn.cursor()
@@ -214,11 +181,11 @@ def inisialisasi_database():
     if cursor.fetchone() is None:
         cursor.execute(
             "INSERT INTO users (username, password) VALUES (?, ?)",
-            ("admin@seller.com", generate_password_hash("admin"))
+            ("admin@seller.com", generate_password_hash("admin")),
         )
     conn.commit()
     conn.close()
-    print("DATABASE: Menggunakan SQLite (siap online)!")
+    print("DATABASE: Menggunakan SQLite (online ready)!")
 
 inisialisasi_database()
 
@@ -231,7 +198,7 @@ def simpan_ke_database(tanggal, kategori, harga, jumlah, total, metode, prediksi
                 """INSERT INTO orders
                 (tanggal_pesanan, kategori, harga_satuan, jumlah, total_harga, metode_pembayaran, prediksi_risiko)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-                (tanggal, kategori, harga, jumlah, total, metode, prediksi_persen)
+                (tanggal, kategori, harga, jumlah, total, metode, prediksi_persen),
             )
             conn.commit()
             cursor.close()
@@ -243,13 +210,12 @@ def simpan_ke_database(tanggal, kategori, harga, jumlah, total, metode, prediksi
                 """INSERT INTO orders
                 (tanggal_pesanan, kategori, harga_satuan, jumlah, total_harga, metode_pembayaran, prediksi_risiko)
                 VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (tanggal, kategori, harga, jumlah, total, metode, prediksi_persen)
+                (tanggal, kategori, harga, jumlah, total, metode, prediksi_persen),
             )
             conn.commit()
             conn.close()
-        print(f"DATABASE: Pesanan berhasil disimpan! (Metode: {metode}, Risiko: {prediksi_persen}%)")
     except Exception as e:
-        print(f"INFO DATABASE: Gagal simpan data ({e})")
+        print(f"INFO DATABASE: Gagal simpan ({e})")
 
 # ==========================================
 # 3. ENDPOINTS API
@@ -260,7 +226,7 @@ def health_check():
         "status": "online",
         "aplikasi": "Admin Seller Center API",
         "database": "MySQL" if USE_MYSQL else "SQLite",
-        "model_loaded": model is not None
+        "model_loaded": len(trees) > 0,
     }), 200
 
 @app.route('/login', methods=['POST'])
@@ -299,10 +265,7 @@ def login():
         if not password_cocok:
             return jsonify({"status": "gagal", "pesan_error": "Password salah!"}), 401
 
-        return jsonify({
-            "status": "sukses",
-            "email": user["username"]
-        }), 200
+        return jsonify({"status": "sukses", "email": user["username"]}), 200
     except Exception as e:
         return jsonify({"status": "gagal", "pesan_error": f"Gagal cek database: {e}"}), 500
 
@@ -330,17 +293,9 @@ def get_orders():
                 elif isinstance(v, float):
                     r[k] = round(v, 2)
 
-        return jsonify({
-            "status": "sukses",
-            "total": len(rows),
-            "data": rows
-        }), 200
+        return jsonify({"status": "sukses", "total": len(rows), "data": rows}), 200
     except Exception as e:
-        return jsonify({
-            "status": "gagal",
-            "pesan_error": str(e),
-            "data": []
-        }), 500
+        return jsonify({"status": "gagal", "pesan_error": str(e), "data": []}), 500
 
 @app.route('/orders/<int:order_id>', methods=['DELETE'])
 def delete_order(order_id):
@@ -371,10 +326,10 @@ def delete_order(order_id):
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
-        if model is None or preprocessor is None:
+        if not trees or model_meta is None:
             return jsonify({
                 "status": "gagal",
-                "pesan_error": "Berkas model (.pkl) belum berhasil dimuat di backend."
+                "pesan_error": "Model prediksi belum berhasil dimuat di backend.",
             }), 500
 
         data = request.get_json()
@@ -412,7 +367,7 @@ def predict():
             "order_day": order_day,
             "order_dayofweek": order_dayofweek,
             "category_name_1": category_name_1,
-            "payment_method_class": payment_method_class
+            "payment_method_class": payment_method_class,
         }
 
         prob_awal = hitung_probabilitas_batal(fitur_pesanan)
@@ -426,7 +381,7 @@ def predict():
             qty_ordered,
             int(grand_total),
             payment_method_class,
-            float(risiko_awal_persen)
+            float(risiko_awal_persen),
         )
 
         hasil_respons = {
@@ -442,7 +397,7 @@ def predict():
             "probabilitas_akhir": None,
             "risiko_akhir_persen": None,
             "pesan_rekomendasi": None,
-            "evaluasi_alternatif": []
+            "evaluasi_alternatif": [],
         }
 
         if is_high_risk:
@@ -458,7 +413,7 @@ def predict():
                 hasil_respons["evaluasi_alternatif"].append({
                     "metode": alt,
                     "probabilitas": round(prob_alt, 4),
-                    "risiko_persen": round(prob_alt * 100, 2)
+                    "risiko_persen": round(prob_alt * 100, 2),
                 })
 
                 if prob_terendah is None or prob_alt < prob_terendah:

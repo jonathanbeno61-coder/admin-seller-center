@@ -11,7 +11,7 @@ import 'dart:convert';
 // - Android Emulator       : http://10.0.2.2:5000
 // - HP Android (1 Wi-Fi)   : http://192.168.x.x:5000 (IP Laptop)
 // - Server Online (Deploy) : https://domain-api-kamu.com
-const String apiBaseUrl = 'http://127.0.0.1:5000';
+const String apiBaseUrl = 'https://jonathanbeno61.pythonanywhere.com';
 
 void main() {
   runApp(const MyApp());
